@@ -19,6 +19,7 @@ class LinearNorm(torch.nn.Module):
 
 
 class ConvNorm(torch.nn.Module):
+    # 其实就只是一个普通的 Conv1d
     def __init__(self, in_channels, out_channels, kernel_size=1, stride=1,
                  padding=None, dilation=1, bias=True, w_init_gain='linear'):
         super(ConvNorm, self).__init__()
@@ -31,6 +32,7 @@ class ConvNorm(torch.nn.Module):
                                     padding=padding, dilation=dilation,
                                     bias=bias)
 
+        # TODO 计算 gain 这件事值得深究，方差保持术
         torch.nn.init.xavier_uniform_(
             self.conv.weight, gain=torch.nn.init.calculate_gain(w_init_gain))
 

@@ -8,10 +8,12 @@ from utils import to_gpu, get_mask_from_lengths
 
 
 class LocationLayer(nn.Module):
+    # 结构上是一个 Conv + Linear
     def __init__(self, attention_n_filters, attention_kernel_size,
                  attention_dim):
         super(LocationLayer, self).__init__()
         padding = int((attention_kernel_size - 1) / 2)
+        # 这样就能处理不定长的历史 attention 之累积了。
         self.location_conv = ConvNorm(2, attention_n_filters,
                                       kernel_size=attention_kernel_size,
                                       padding=padding, bias=False, stride=1,
@@ -54,12 +56,13 @@ class Attention(nn.Module):
         alignment (batch, max_time)
         """
 
-        processed_query = self.query_layer(query.unsqueeze(1))
+        processed_query = self.query_layer(query.unsqueeze(1)) # (B, 1, C)
         processed_attention_weights = self.location_layer(attention_weights_cat)
+        # 采用的 Additive attention 不仅 Q 和 K， 还有历史 attention 信息也纳入了考虑范围
         energies = self.v(torch.tanh(
             processed_query + processed_attention_weights + processed_memory))
 
-        energies = energies.squeeze(-1)
+        energies = energies.squeeze(-1) # (B, T_enc)
         return energies
 
     def forward(self, attention_hidden_state, memory, processed_memory,
@@ -89,6 +92,7 @@ class Attention(nn.Module):
 class Prenet(nn.Module):
     def __init__(self, in_dim, sizes):
         super(Prenet, self).__init__()
+        # 真是要多少层都可以呢。
         in_sizes = [in_dim] + sizes[:-1]
         self.layers = nn.ModuleList(
             [LinearNorm(in_size, out_size, bias=False)
@@ -96,6 +100,9 @@ class Prenet(nn.Module):
 
     def forward(self, x):
         for linear in self.layers:
+            # 不是啊，这里也是明确指定了，任何事都都要 dropout 的啊
+            # 训练时是一种泛化手段，预测时，其实也可以不依靠 decoder input
+            # 而且预测时使用 dropout 可以带来可变性
             x = F.dropout(F.relu(linear(x)), p=0.5, training=True)
         return x
 
@@ -174,7 +181,7 @@ class Encoder(nn.Module):
         for conv in self.convolutions:
             x = F.dropout(F.relu(conv(x)), 0.5, self.training)
 
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2) # 从 conv 系列转回 rnn 系列
 
         # pytorch tensor are not reversible, hence the conversion
         input_lengths = input_lengths.cpu().numpy()
@@ -187,7 +194,7 @@ class Encoder(nn.Module):
         outputs, _ = nn.utils.rnn.pad_packed_sequence(
             outputs, batch_first=True)
 
-        return outputs
+        return outputs # (B, T, C)
 
     def inference(self, x):
         for conv in self.convolutions:
@@ -195,6 +202,7 @@ class Encoder(nn.Module):
 
         x = x.transpose(1, 2)
 
+        # 不再来 pack & pad 是因为仅支持单样本预测吧。
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
 
@@ -205,7 +213,7 @@ class Decoder(nn.Module):
     def __init__(self, hparams):
         super(Decoder, self).__init__()
         self.n_mel_channels = hparams.n_mel_channels
-        self.n_frames_per_step = hparams.n_frames_per_step
+        self.n_frames_per_step = hparams.n_frames_per_step # 所以其实还是有这个参数的， 但是没有 gradual training
         self.encoder_embedding_dim = hparams.encoder_embedding_dim
         self.attention_rnn_dim = hparams.attention_rnn_dim
         self.decoder_rnn_dim = hparams.decoder_rnn_dim
@@ -215,6 +223,7 @@ class Decoder(nn.Module):
         self.p_attention_dropout = hparams.p_attention_dropout
         self.p_decoder_dropout = hparams.p_decoder_dropout
 
+        # 其实就是多层的 Linear + relu + dropout
         self.prenet = Prenet(
             hparams.n_mel_channels * hparams.n_frames_per_step,
             [hparams.prenet_dim, hparams.prenet_dim])
@@ -349,12 +358,17 @@ class Decoder(nn.Module):
         gate_output: gate output energies
         attention_weights:
         """
+        # context vector 用于下一次的输入的这种操作呢
+        # attention context 一开始是置为 0 的
+        # 走一步 RNN
         cell_input = torch.cat((decoder_input, self.attention_context), -1)
         self.attention_hidden, self.attention_cell = self.attention_rnn(
             cell_input, (self.attention_hidden, self.attention_cell))
         self.attention_hidden = F.dropout(
             self.attention_hidden, self.p_attention_dropout, self.training)
 
+        # 历史 attention 和最新一步的 attention cat 在一起
+        # 然后来一个 context vector 和 attention weight
         attention_weights_cat = torch.cat(
             (self.attention_weights.unsqueeze(1),
              self.attention_weights_cum.unsqueeze(1)), dim=1)
@@ -362,6 +376,7 @@ class Decoder(nn.Module):
             self.attention_hidden, self.memory, self.processed_memory,
             attention_weights_cat, self.mask)
 
+        # decoder RNNCell
         self.attention_weights_cum += self.attention_weights
         decoder_input = torch.cat(
             (self.attention_hidden, self.attention_context), -1)
@@ -395,7 +410,7 @@ class Decoder(nn.Module):
 
         decoder_input = self.get_go_frame(memory).unsqueeze(0)
         decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
-        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0)
+        decoder_inputs = torch.cat((decoder_input, decoder_inputs), dim=0) # (T, B, C)
         decoder_inputs = self.prenet(decoder_inputs)
 
         self.initialize_decoder_states(
@@ -403,7 +418,7 @@ class Decoder(nn.Module):
 
         mel_outputs, gate_outputs, alignments = [], [], []
         while len(mel_outputs) < decoder_inputs.size(0) - 1:
-            decoder_input = decoder_inputs[len(mel_outputs)]
+            decoder_input = decoder_inputs[len(mel_outputs)] # (B, C) 单步输入
             mel_output, gate_output, attention_weights = self.decode(
                 decoder_input)
             mel_outputs += [mel_output.squeeze(1)]
@@ -439,7 +454,9 @@ class Decoder(nn.Module):
             mel_outputs += [mel_output.squeeze(1)]
             gate_outputs += [gate_output]
             alignments += [alignment]
-
+            
+            # 注意， 这里面 stop_logit 和 attention weight 是步调一致的
+            # 即使 multi-frame, 一步也只有一个 stop_logit (B=1, T=1)
             if torch.sigmoid(gate_output.data) > self.gate_threshold:
                 break
             elif len(mel_outputs) == self.max_decoder_steps:
@@ -458,11 +475,14 @@ class Tacotron2(nn.Module):
     def __init__(self, hparams):
         super(Tacotron2, self).__init__()
         self.mask_padding = hparams.mask_padding
-        self.fp16_run = hparams.fp16_run
+        self.fp16_run = hparams.fp16_run # 这个就显得比较 cube, 实现影响了接口的典型
         self.n_mel_channels = hparams.n_mel_channels
         self.n_frames_per_step = hparams.n_frames_per_step
+
+        # torch 的 Embedding 默认是 N(0, 1)
         self.embedding = nn.Embedding(
             hparams.n_symbols, hparams.symbols_embedding_dim)
+        # 这不就是 Xavier 吗
         std = sqrt(2.0 / (hparams.n_symbols + hparams.symbols_embedding_dim))
         val = sqrt(3.0) * std  # uniform bounds for std
         self.embedding.weight.data.uniform_(-val, val)
@@ -471,6 +491,7 @@ class Tacotron2(nn.Module):
         self.postnet = Postnet(hparams)
 
     def parse_batch(self, batch):
+        # text， text_length, mel, stop, frame_length
         text_padded, input_lengths, mel_padded, gate_padded, \
             output_lengths = batch
         text_padded = to_gpu(text_padded).long()
@@ -480,6 +501,7 @@ class Tacotron2(nn.Module):
         gate_padded = to_gpu(gate_padded).float()
         output_lengths = to_gpu(output_lengths).long()
 
+        # 这是为了区分 x 和 y? 还真是， y 对于网络计算来说不是必要的， 但是 output_lengths 其实也不必要
         return (
             (text_padded, input_lengths, mel_padded, max_len, output_lengths),
             (mel_padded, gate_padded))
@@ -488,7 +510,7 @@ class Tacotron2(nn.Module):
         if self.mask_padding and output_lengths is not None:
             mask = ~get_mask_from_lengths(output_lengths)
             mask = mask.expand(self.n_mel_channels, mask.size(0), mask.size(1))
-            mask = mask.permute(1, 0, 2)
+            mask = mask.permute(1, 0, max(input_lengths.data).item()2)
 
             outputs[0].data.masked_fill_(mask, 0.0)
             outputs[1].data.masked_fill_(mask, 0.0)
@@ -498,9 +520,10 @@ class Tacotron2(nn.Module):
 
     def forward(self, inputs):
         text_inputs, text_lengths, mels, max_len, output_lengths = inputs
+        # 这两个字段 Tensor 即可，不需要是 Variable
         text_lengths, output_lengths = text_lengths.data, output_lengths.data
 
-        embedded_inputs = self.embedding(text_inputs).transpose(1, 2)
+        embedded_inputs = self.embedding(text_inputs).transpose(1, 2) # (B, C, T)
 
         encoder_outputs = self.encoder(embedded_inputs, text_lengths)
 

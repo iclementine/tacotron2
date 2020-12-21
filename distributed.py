@@ -123,6 +123,7 @@ class DistributedDataParallel(Module):
 Modifies existing model to do gradient allreduce, but doesn't change class
 so you don't need "module"
 '''
+# 这个看起来还是不错的，这样单卡模型和多卡模型的写法用法都一样了呢
 def apply_gradient_allreduce(module):
         if not hasattr(dist, '_backend'):
             module.warn_on_half = True

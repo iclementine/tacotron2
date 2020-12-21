@@ -73,6 +73,7 @@ def prepare_directories_and_logger(output_directory, log_directory, rank):
 def load_model(hparams):
     model = Tacotron2(hparams).cuda()
     if hparams.fp16_run:
+        # 这一点就有点狗皮膏药了啊，因为您需要具体指定是哪个参数或者哪个配置
         model.decoder.attention_layer.score_mask_value = finfo('float16').min
 
     if hparams.distributed_run:
@@ -271,6 +272,7 @@ if __name__ == '__main__':
                         required=False, help='rank of current gpu')
     parser.add_argument('--group_name', type=str, default='group_name',
                         required=False, help='Distributed group name')
+    # 也是经典的自由修改式的写法
     parser.add_argument('--hparams', type=str,
                         required=False, help='comma separated name=value pairs')
 
